@@ -28,10 +28,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEVKIT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 COMPOSE_FILE="${DEVKIT_ROOT}/docker/docker-compose.yml"
-# Prebuilt image published by CI (see .github/workflows/build-image.yml); the
-# local name is what `docker compose build` / `srl --build` produces.
+# Prebuilt image published by CI (see .github/workflows/build-image.yml). This
+# is also the tag `docker compose build` / `srl --build` writes locally, so a
+# local build transparently overrides the pulled image under the same name.
 REMOTE_IMAGE=ghcr.io/cu-srl/srl-zephyr-devkit:latest
-LOCAL_IMAGE=srl-zephyr-devkit
 
 # Default root: the dir holding this devkit (its siblings live here).
 DEFAULT_ROOT="$(cd "${DEVKIT_ROOT}/.." && pwd)"
@@ -48,9 +48,9 @@ _img_present() { [ -n "$(docker images -q "$1" 2>/dev/null)" ]; }
 # Decide which image to run, fetching it if needed.
 case "${MODE}" in
   build)
-    echo ">> building ${LOCAL_IMAGE} locally (downloads the Zephyr SDK; be patient)..." >&2
+    echo ">> building ${REMOTE_IMAGE} locally (downloads the Zephyr SDK; be patient)..." >&2
     docker compose -f "${COMPOSE_FILE}" build
-    IMAGE="${LOCAL_IMAGE}"
+    IMAGE="${REMOTE_IMAGE}"
     ;;
   pull)
     echo ">> pulling ${REMOTE_IMAGE}..." >&2
@@ -60,8 +60,6 @@ case "${MODE}" in
   auto)
     if _img_present "${REMOTE_IMAGE}"; then
       IMAGE="${REMOTE_IMAGE}"
-    elif _img_present "${LOCAL_IMAGE}"; then
-      IMAGE="${LOCAL_IMAGE}"
     else
       echo ">> pulling prebuilt ${REMOTE_IMAGE} (first run; no local build needed)..." >&2
       if docker pull "${REMOTE_IMAGE}"; then
