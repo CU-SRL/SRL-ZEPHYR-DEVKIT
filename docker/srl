@@ -99,11 +99,6 @@ def load_registry(rescan=False):
     return reg
 
 
-def zephyr_populated(repo_path):
-    z = os.path.join(repo_path, "zephyr")
-    return os.path.isdir(z) and bool(os.listdir(z))
-
-
 def cmd_refresh(_args):
     reg = discover()
     write_cache(reg)
@@ -119,7 +114,7 @@ def print_summary(reg):
     print(f">> registered repos ({len(reg)}):", file=sys.stderr)
     for name, meta in reg.items():
         zver = meta.get("zephyr", "?")
-        ready = "ready" if zephyr_populated(meta["path"]) else "needs `srl update`"
+        ready = "ready" if zephyr_populated(repo_workspace(meta)) else "needs `srl update`"
         flag = ""
         if img_zephyr and zver not in ("?", img_zephyr):
             flag = f"  [!] zephyr {zver} != image {img_zephyr}"
@@ -134,6 +129,9 @@ def cmd_list(_args):
         return 1
     for name, meta in reg.items():
         print(f"{name}")
+        ws = meta.get("workspace", ".")
+        if ws not in (".", "", None):
+            print(f"    workspace    {ws}")
         print(f"    app          {meta.get('app','?')}")
         print(f"    zephyr       {meta.get('zephyr','?')}")
         print(f"    default      {meta.get('default_board','?')}")
@@ -141,13 +139,26 @@ def cmd_list(_args):
         if boards:
             aliases = "  ".join(f"{k}->{v}" for k, v in boards.items())
             print(f"    boards       {aliases}")
-        print(f"    ready        {'yes' if zephyr_populated(meta['path']) else 'no (run srl update)'}")
+        print(f"    ready        {'yes' if zephyr_populated(repo_workspace(meta)) else 'no (run srl update)'}")
     return 0
 
 
 # --------------------------------------------------------------------------- #
 # Helpers shared by build/flash/run/etc.
 # --------------------------------------------------------------------------- #
+def repo_workspace(meta):
+    """Directory holding this repo's west workspace (its .west), where west is
+    run. `workspace:` in srl.yml is relative to the repo root and defaults to
+    the root -- set it when .west lives in a subdirectory (e.g. WALRUS keeps
+    its workspace at ground/station/)."""
+    return os.path.normpath(os.path.join(meta["path"], meta.get("workspace", ".")))
+
+
+def zephyr_populated(workspace):
+    z = os.path.join(workspace, "zephyr")
+    return os.path.isdir(z) and bool(os.listdir(z))
+
+
 def split_target(token):
     """`SRL-PHOENIX/phoenix_pcb` -> ('SRL-PHOENIX', 'phoenix_pcb'). Board opt."""
     if "/" in token:
@@ -187,16 +198,16 @@ def run_west(argv, cwd):
 
 
 def ensure_zephyr(meta):
-    """Lazy first-time `west update` for this repo if zephyr/ is empty."""
-    path = meta["path"]
-    if zephyr_populated(path):
+    """Lazy first-time `west update` for this repo if its zephyr/ is empty."""
+    ws = repo_workspace(meta)
+    if zephyr_populated(ws):
         return
-    if not os.path.isdir(os.path.join(path, ".west")):
-        die(f"{meta['_dir']}: no .west workspace -- run `west init` in the repo "
-            f"first (this devkit does not init workspaces).")
+    if not os.path.isdir(os.path.join(ws, ".west")):
+        die(f"{meta['_dir']}: no .west workspace at {ws} -- run `west init` "
+            f"there first (this devkit does not init workspaces).")
     warn(f"{meta['_dir']}: zephyr/ is empty; running first-time `west update` "
          f"(this can take a while)...")
-    rc = run_west(["west", "update"], cwd=path)
+    rc = run_west(["west", "update"], cwd=ws)
     if rc != 0:
         die("`west update` failed -- fix connectivity and retry.")
 
@@ -249,6 +260,7 @@ def cmd_build(args):
     meta = get_repo(repo_name)
     warn_version(meta)
     ensure_zephyr(meta)
+    ws = repo_workspace(meta)
     board = resolve_board(meta, board_in)
     bdir = build_dir_for(meta, board)
     app = meta.get("app") or die(f"{meta['_dir']}: srl.yml has no `app:`")
@@ -273,7 +285,7 @@ def cmd_build(args):
     # via west's pristine.cmake, which reads the existing CMake cache and fails
     # when that dir was generated on a different host (e.g. built on the macOS
     # host at /Users/... then rebuilt here at /workspaces/...).
-    abs_bdir = os.path.join(meta["path"], bdir)
+    abs_bdir = os.path.join(ws, bdir)
     if pristine == "always" and os.path.isdir(abs_bdir):
         sys.stderr.write(f"+ rm -rf {bdir}  (pristine)\n")
         shutil.rmtree(abs_bdir)
@@ -284,15 +296,16 @@ def cmd_build(args):
     argv += [app]
     if dargs or extra:
         argv += ["--"] + dargs + extra
-    return run_west(argv, cwd=meta["path"])
+    return run_west(argv, cwd=ws)
 
 
 def cmd_run(args):
     if not args:
         die("usage: srl run <repo> [args...]")
     meta = get_repo(args[0])
+    ws = repo_workspace(meta)
     board = meta.get("sim_board") or "native_sim/native/64"
-    exe = os.path.join(meta["path"], build_dir_for(meta, board), "zephyr", "zephyr.exe")
+    exe = os.path.join(ws, build_dir_for(meta, board), "zephyr", "zephyr.exe")
     if not os.path.isfile(exe) or not os.access(exe, os.X_OK):
         die(f"no native_sim build at {exe} -- run `srl build {args[0]}/sim` first")
     sys.stderr.write(f"+ {exe} {' '.join(args[1:])}\n")
@@ -321,7 +334,7 @@ def cmd_flash(args):
     argv = ["west", "flash", "--build-dir", build_dir_for(meta, board)]
     if runner:
         argv += ["--runner", runner]
-    return run_west(argv, cwd=meta["path"])
+    return run_west(argv, cwd=repo_workspace(meta))
 
 
 def cmd_menuconfig(args):
@@ -332,7 +345,7 @@ def cmd_menuconfig(args):
     board = resolve_board(meta, board_in)
     return run_west(
         ["west", "build", "-d", build_dir_for(meta, board), "-t", "menuconfig"],
-        cwd=meta["path"])
+        cwd=repo_workspace(meta))
 
 
 def cmd_clean(args):
@@ -341,13 +354,14 @@ def cmd_clean(args):
     repo_name, board_in = split_target(args[0])
     all_flag = "--all" in args[1:]
     meta = get_repo(repo_name)
+    ws = repo_workspace(meta)
     if all_flag:
-        target = os.path.join(meta["path"], "build")
+        target = os.path.join(ws, "build")
         label = "build"
     else:
         board = resolve_board(meta, board_in)
         label = build_dir_for(meta, board)
-        target = os.path.join(meta["path"], label)
+        target = os.path.join(ws, label)
     sys.stderr.write(f"+ rm -rf {label}\n")
     if os.path.isdir(target):
         shutil.rmtree(target)
@@ -358,7 +372,7 @@ def cmd_update(args):
     if not args:
         die("usage: srl update <repo>")
     meta = get_repo(args[0])
-    return run_west(["west", "update"] + list(args[1:]), cwd=meta["path"])
+    return run_west(["west", "update"] + list(args[1:]), cwd=repo_workspace(meta))
 
 
 COMMANDS = {

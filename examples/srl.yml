@@ -6,7 +6,13 @@
 # Display name (cosmetic; the directory name is what you type on the CLI).
 name: MY-ZEPHYR-REPO
 
-# Application source dir, relative to the repo root (passed to `west build`).
+# Optional: subdirectory that holds the west workspace (its .west), relative to
+# the repo root. Defaults to the repo root -- only set it when .west lives in a
+# subdir (e.g. WALRUS keeps its workspace at ground/station/).
+# workspace: ground/station
+
+# Application source dir, relative to the workspace (the repo root unless
+# `workspace:` is set above). Passed to `west build`.
 app: app
 
 # Zephyr version this repo pins in its west.yaml. Used only to warn you if it
