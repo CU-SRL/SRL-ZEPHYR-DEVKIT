@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""srl -- multi-repo Zephyr build tool for the SRL devkit (runs in the container).
+
+Discovers repos bind-mounted under /workspaces that carry an `srl.yml`, and
+drives their `west build/flash/...` from one command, so you never retype the
+long west invocations and you address any repo by name:
+
+    srl list                                     # show registered repos
+    srl build  <repo>[/<board>] [opts] [-- ...]  # build a board in a repo
+    srl run    <repo> [args...]                  # run its native_sim exe
+    srl flash  <repo>[/<board>] [-r RUNNER]      # flash a built image
+    srl menuconfig <repo>[/<board>]              # open Kconfig menuconfig
+    srl clean  <repo>[/<board> | --all]          # remove build dir(s)
+    srl update <repo>                            # west update in that repo
+    srl refresh                                  # rescan the registry
+
+`<board>` may be a repo-defined alias (see srl.yml `boards:`); anything else is
+passed straight through to west. Every command prints the exact west line it
+runs, prefixed with `+ `.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+WORKSPACES = "/workspaces"
+REGISTRY_CACHE = "/tmp/srl-registry.json"
+META_NAMES = ("srl.yml", ".srl.yml")
+
+PROG = "srl"
+
+
+def die(msg):
+    sys.stderr.write(f"{PROG}: {msg}\n")
+    sys.exit(1)
+
+
+def warn(msg):
+    sys.stderr.write(f"{PROG}: {msg}\n")
+
+
+def load_yaml(path):
+    try:
+        import yaml
+    except ImportError:
+        die("PyYAML not installed in the image -- rebuild with `srl --build` "
+            "(host) or `pip install pyyaml`.")
+    with open(path) as fh:
+        data = yaml.safe_load(fh) or {}
+    if not isinstance(data, dict):
+        die(f"{path}: expected a YAML mapping at the top level")
+    return data
+
+
+# --------------------------------------------------------------------------- #
+# Registry
+# --------------------------------------------------------------------------- #
+def discover():
+    """Scan /workspaces for repos carrying an srl.yml; return {name: meta}."""
+    reg = {}
+    if not os.path.isdir(WORKSPACES):
+        return reg
+    for entry in sorted(os.listdir(WORKSPACES)):
+        repo = os.path.join(WORKSPACES, entry)
+        if not os.path.isdir(repo):
+            continue
+        meta_path = next(
+            (os.path.join(repo, n) for n in META_NAMES
+             if os.path.isfile(os.path.join(repo, n))), None)
+        if not meta_path:
+            continue
+        meta = load_yaml(meta_path)
+        meta["path"] = repo
+        # Directory name is the address you type; `name:` is a display alias.
+        meta.setdefault("name", entry)
+        meta["_dir"] = entry
+        reg[entry] = meta
+    return reg
+
+
+def write_cache(reg):
+    try:
+        with open(REGISTRY_CACHE, "w") as fh:
+            json.dump(reg, fh)
+    except OSError:
+        pass  # cache is an optimization; ignore failures
+
+
+def load_registry(rescan=False):
+    if not rescan and os.path.isfile(REGISTRY_CACHE):
+        try:
+            with open(REGISTRY_CACHE) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            pass
+    reg = discover()
+    write_cache(reg)
+    return reg
+
+
+def zephyr_populated(repo_path):
+    z = os.path.join(repo_path, "zephyr")
+    return os.path.isdir(z) and bool(os.listdir(z))
+
+
+def cmd_refresh(_args):
+    reg = discover()
+    write_cache(reg)
+    print_summary(reg)
+    return 0
+
+
+def print_summary(reg):
+    if not reg:
+        warn(f"no repos with an srl.yml found under {WORKSPACES}.")
+        return
+    img_zephyr = os.environ.get("SRL_IMAGE_ZEPHYR", "")
+    print(f">> registered repos ({len(reg)}):", file=sys.stderr)
+    for name, meta in reg.items():
+        zver = meta.get("zephyr", "?")
+        ready = "ready" if zephyr_populated(meta["path"]) else "needs `srl update`"
+        flag = ""
+        if img_zephyr and zver not in ("?", img_zephyr):
+            flag = f"  [!] zephyr {zver} != image {img_zephyr}"
+        print(f"   - {name:<22} app={meta.get('app','?'):<16} "
+              f"zephyr={zver:<8} {ready}{flag}", file=sys.stderr)
+
+
+def cmd_list(_args):
+    reg = load_registry(rescan=True)
+    if not reg:
+        warn(f"no repos with an srl.yml found under {WORKSPACES}.")
+        return 1
+    for name, meta in reg.items():
+        print(f"{name}")
+        print(f"    app          {meta.get('app','?')}")
+        print(f"    zephyr       {meta.get('zephyr','?')}")
+        print(f"    default      {meta.get('default_board','?')}")
+        boards = meta.get("boards") or {}
+        if boards:
+            aliases = "  ".join(f"{k}->{v}" for k, v in boards.items())
+            print(f"    boards       {aliases}")
+        print(f"    ready        {'yes' if zephyr_populated(meta['path']) else 'no (run srl update)'}")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Helpers shared by build/flash/run/etc.
+# --------------------------------------------------------------------------- #
+def split_target(token):
+    """`SRL-PHOENIX/phoenix_pcb` -> ('SRL-PHOENIX', 'phoenix_pcb'). Board opt."""
+    if "/" in token:
+        repo, board = token.split("/", 1)
+        return repo, board
+    return token, None
+
+
+def get_repo(name):
+    reg = load_registry()
+    if name not in reg:
+        # maybe the cache is stale -- rescan once before giving up
+        reg = load_registry(rescan=True)
+    if name not in reg:
+        avail = ", ".join(reg) or "(none)"
+        die(f"unknown repo '{name}'. Registered: {avail}")
+    return reg[name]
+
+
+def resolve_board(meta, board_in):
+    if not board_in:
+        return meta.get("default_board") or die(
+            f"{meta['_dir']}: no board given and no default_board in srl.yml")
+    boards = meta.get("boards") or {}
+    return boards.get(board_in, board_in)
+
+
+def build_dir_for(meta, board):
+    app_base = os.path.basename(meta.get("app", "app"))
+    return f"build/{board}/{app_base}"
+
+
+def run_west(argv, cwd):
+    sys.stderr.write("+ " + " ".join(argv) + "\n")
+    sys.stderr.flush()
+    return subprocess.call(argv, cwd=cwd)
+
+
+def ensure_zephyr(meta):
+    """Lazy first-time `west update` for this repo if zephyr/ is empty."""
+    path = meta["path"]
+    if zephyr_populated(path):
+        return
+    if not os.path.isdir(os.path.join(path, ".west")):
+        die(f"{meta['_dir']}: no .west workspace -- run `west init` in the repo "
+            f"first (this devkit does not init workspaces).")
+    warn(f"{meta['_dir']}: zephyr/ is empty; running first-time `west update` "
+         f"(this can take a while)...")
+    rc = run_west(["west", "update"], cwd=path)
+    if rc != 0:
+        die("`west update` failed -- fix connectivity and retry.")
+
+
+def warn_version(meta):
+    img = os.environ.get("SRL_IMAGE_ZEPHYR", "")
+    want = meta.get("zephyr")
+    if img and want and want != img:
+        warn(f"note: {meta['_dir']} pins zephyr {want} but this image ships "
+             f"{img}; build may misbehave if they are incompatible.")
+
+
+def join_semi(items):
+    return ";".join(items)
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+def cmd_build(args):
+    if not args:
+        die("usage: srl build <repo>[/<board>] [-b BOARD] [-d] [--no-pristine] [-- <cmake args>]")
+    repo_name, board_in = split_target(args[0])
+    rest = args[1:]
+
+    debug = False
+    pristine = "always"
+    target = None
+    extra = []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a in ("-b", "--board"):
+            board_in = rest[i + 1]; i += 2
+        elif a in ("-d", "--debug"):
+            debug = True; i += 1
+        elif a in ("-p", "--pristine"):
+            pristine = rest[i + 1]; i += 2
+        elif a == "--no-pristine":
+            pristine = "never"; i += 1
+        elif a in ("-t", "--target"):
+            target = rest[i + 1]; i += 2
+        elif a == "--":
+            extra = rest[i + 1:]; break
+        elif a.startswith("-"):
+            die(f"unknown build option: {a}")
+        else:
+            board_in = a; i += 1
+
+    meta = get_repo(repo_name)
+    warn_version(meta)
+    ensure_zephyr(meta)
+    board = resolve_board(meta, board_in)
+    bdir = build_dir_for(meta, board)
+    app = meta.get("app") or die(f"{meta['_dir']}: srl.yml has no `app:`")
+
+    # Assemble the config/overlay -D args this board/mode needs, from srl.yml.
+    board_cfg = (meta.get("board_config") or {}).get(board, {})
+    conf = list(board_cfg.get("conf", []))
+    overlay = list(board_cfg.get("overlay", []))
+    if debug:
+        dbg = (meta.get("configs") or {}).get("debug")
+        if not dbg:
+            die(f"{meta['_dir']}: -d given but srl.yml has no configs.debug")
+        conf.append(dbg)
+
+    dargs = []
+    if conf:
+        dargs += ["-D", f"EXTRA_CONF_FILE={join_semi(conf)}"]
+    if overlay:
+        dargs += ["-D", f"DTC_OVERLAY_FILE={join_semi(overlay)}"]
+
+    # `--pristine always` means wipe the build dir. Do it ourselves instead of
+    # via west's pristine.cmake, which reads the existing CMake cache and fails
+    # when that dir was generated on a different host (e.g. built on the macOS
+    # host at /Users/... then rebuilt here at /workspaces/...).
+    abs_bdir = os.path.join(meta["path"], bdir)
+    if pristine == "always" and os.path.isdir(abs_bdir):
+        sys.stderr.write(f"+ rm -rf {bdir}  (pristine)\n")
+        shutil.rmtree(abs_bdir)
+
+    argv = ["west", "build", "-b", board, "-d", bdir, "--pristine", pristine]
+    if target:
+        argv += ["-t", target]
+    argv += [app]
+    if dargs or extra:
+        argv += ["--"] + dargs + extra
+    return run_west(argv, cwd=meta["path"])
+
+
+def cmd_run(args):
+    if not args:
+        die("usage: srl run <repo> [args...]")
+    meta = get_repo(args[0])
+    board = meta.get("sim_board") or "native_sim/native/64"
+    exe = os.path.join(meta["path"], build_dir_for(meta, board), "zephyr", "zephyr.exe")
+    if not os.path.isfile(exe) or not os.access(exe, os.X_OK):
+        die(f"no native_sim build at {exe} -- run `srl build {args[0]}/sim` first")
+    sys.stderr.write(f"+ {exe} {' '.join(args[1:])}\n")
+    os.execv(exe, [exe] + list(args[1:]))
+
+
+def cmd_flash(args):
+    if not args:
+        die("usage: srl flash <repo>[/<board>] [-r RUNNER]")
+    repo_name, board_in = split_target(args[0])
+    rest = args[1:]
+    runner = None
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a in ("-b", "--board"):
+            board_in = rest[i + 1]; i += 2
+        elif a in ("-r", "--runner"):
+            runner = rest[i + 1]; i += 2
+        else:
+            die(f"unknown flash option: {a}")
+    meta = get_repo(repo_name)
+    board = resolve_board(meta, board_in)
+    if not runner:
+        runner = (meta.get("runners") or {}).get(board)
+    argv = ["west", "flash", "--build-dir", build_dir_for(meta, board)]
+    if runner:
+        argv += ["--runner", runner]
+    return run_west(argv, cwd=meta["path"])
+
+
+def cmd_menuconfig(args):
+    if not args:
+        die("usage: srl menuconfig <repo>[/<board>]")
+    repo_name, board_in = split_target(args[0])
+    meta = get_repo(repo_name)
+    board = resolve_board(meta, board_in)
+    return run_west(
+        ["west", "build", "-d", build_dir_for(meta, board), "-t", "menuconfig"],
+        cwd=meta["path"])
+
+
+def cmd_clean(args):
+    if not args:
+        die("usage: srl clean <repo>[/<board> | --all]")
+    repo_name, board_in = split_target(args[0])
+    all_flag = "--all" in args[1:]
+    meta = get_repo(repo_name)
+    if all_flag:
+        target = os.path.join(meta["path"], "build")
+        label = "build"
+    else:
+        board = resolve_board(meta, board_in)
+        label = build_dir_for(meta, board)
+        target = os.path.join(meta["path"], label)
+    sys.stderr.write(f"+ rm -rf {label}\n")
+    if os.path.isdir(target):
+        shutil.rmtree(target)
+    return 0
+
+
+def cmd_update(args):
+    if not args:
+        die("usage: srl update <repo>")
+    meta = get_repo(args[0])
+    return run_west(["west", "update"] + list(args[1:]), cwd=meta["path"])
+
+
+COMMANDS = {
+    "list": cmd_list,
+    "ls": cmd_list,
+    "refresh": cmd_refresh,
+    "build": cmd_build,
+    "b": cmd_build,
+    "run": cmd_run,
+    "r": cmd_run,
+    "flash": cmd_flash,
+    "f": cmd_flash,
+    "menuconfig": cmd_menuconfig,
+    "guiconfig": cmd_menuconfig,
+    "clean": cmd_clean,
+    "update": cmd_update,
+}
+
+
+def usage():
+    sys.stderr.write(__doc__)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        usage()
+        return 0 if argv else 1
+    cmd = argv[0]
+    fn = COMMANDS.get(cmd)
+    if not fn:
+        die(f"unknown command: {cmd} (try 'srl --help')")
+    return fn(argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

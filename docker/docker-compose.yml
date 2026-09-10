@@ -1,0 +1,26 @@
+# SRL Zephyr devkit build environment.
+#
+# This file's main job is to BUILD the shared image:
+#   docker compose -f docker/docker-compose.yml build
+#
+# For day-to-day use, prefer the `srl` host launcher (bin/srl): it discovers
+# every repo that carries an srl.yml and bind-mounts them all at once under
+# /workspaces/<name>. This compose `dev` service is a single-root fallback --
+# it mounts one directory tree at /workspaces (default: the devkit's parent
+# dir, i.e. all sibling repos), which also exposes non-Zephyr siblings.
+#
+# Use `run`, NOT `docker compose up`: the command is an interactive shell, and
+# `up` only streams logs without attaching a terminal.
+services:
+  dev:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.dev
+    image: srl-zephyr-devkit
+    working_dir: /workspaces
+    stdin_open: true
+    tty: true
+    volumes:
+      # SRL_WORKSPACES may point at the directory that holds your repos.
+      # Default `../..` = the devkit's parent dir (its sibling repos).
+      - ${SRL_WORKSPACES:-../..}:/workspaces

@@ -1,0 +1,5 @@
+# The devkit ships only the build environment + tooling. Repos live as
+# siblings and are mounted at runtime -- never checked in here.
+__pycache__/
+*.pyc
+.DS_Store

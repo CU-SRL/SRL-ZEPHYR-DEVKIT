@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# srl -- host launcher for the SRL Zephyr devkit.
+#
+# Discovers every sibling repo of this devkit checkout that carries an srl.yml
+# (non-recursive: only directories at the same level as SRL-ZEPHYR-DEVKIT),
+# bind-mounts each into the shared build container at /workspaces/<name>, and
+# runs the in-container `srl` tool (or an interactive shell).
+#
+#   srl                          # open an interactive shell (at /workspaces)
+#   srl shell                    # same
+#   srl list                     # list discovered repos
+#   srl build SRL-PHOENIX/pcb    # build a board in a repo
+#   srl flash SRL-PHOENIX/pcb    # forwarded straight to the in-container tool
+#   srl --build [args...]        # force-rebuild the image first, then run
+#
+# Discovery root: by default the directory that CONTAINS this devkit checkout,
+# so any sibling repo is found by location (not by the parent's name). Override
+# with SRL_WORKSPACES (colon-separated list of roots to scan). Scanning is
+# one level deep only.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEVKIT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+COMPOSE_FILE="${DEVKIT_ROOT}/docker/docker-compose.yml"
+IMAGE=srl-zephyr-devkit
+
+# Default root: the dir holding this devkit (its siblings live here).
+DEFAULT_ROOT="$(cd "${DEVKIT_ROOT}/.." && pwd)"
+
+# Parse leading launcher flags (only --build for now).
+FORCE_BUILD=0
+if [ "${1:-}" = "--build" ]; then FORCE_BUILD=1; shift; fi
+
+# Build the image if missing (first run) or requested.
+if [ "${FORCE_BUILD}" -eq 1 ] || [ -z "$(docker images -q "${IMAGE}" 2>/dev/null)" ]; then
+  echo ">> building ${IMAGE} (first run downloads the Zephyr SDK; be patient)..." >&2
+  docker compose -f "${COMPOSE_FILE}" build
+fi
+
+# Split SRL_WORKSPACES on ':' into ROOTS (default = the devkit's parent).
+ROOTS=()
+_ws="${SRL_WORKSPACES:-${DEFAULT_ROOT}}"
+_old_ifs="$IFS"; IFS=':'
+for r in $_ws; do [ -n "$r" ] && ROOTS+=("$r"); done
+IFS="$_old_ifs"
+
+# Discover repos: any immediate subdir of a root that has srl.yml / .srl.yml.
+# One level deep only -- no recursive walk.
+MOUNTS=()
+SEEN=":"
+for root in "${ROOTS[@]}"; do
+  [ -d "${root}" ] || continue
+  for d in "${root}"/*/; do
+    [ -f "${d}srl.yml" ] || [ -f "${d}.srl.yml" ] || continue
+    name="$(basename "${d}")"
+    case "${SEEN}" in *":${name}:"*) continue ;; esac   # first match wins
+    SEEN="${SEEN}${name}:"
+    abs="$(cd "${d}" && pwd)"
+    MOUNTS+=(-v "${abs}:/workspaces/${name}")
+  done
+done
+
+if [ "${#MOUNTS[@]}" -eq 0 ]; then
+  echo "warning: no repos with srl.yml found under: ${ROOTS[*]}" >&2
+  echo "         add an srl.yml to a repo (see the devkit README) and retry." >&2
+fi
+
+# No args or 'shell' -> interactive shell; otherwise forward to in-container srl.
+if [ $# -eq 0 ] || [ "${1:-}" = "shell" ]; then
+  [ $# -gt 0 ] && shift
+  set -- bash
+else
+  set -- srl "$@"
+fi
+
+exec docker run --rm -it \
+  ${MOUNTS[@]+"${MOUNTS[@]}"} \
+  -w /workspaces \
+  "${IMAGE}" "$@"

@@ -1,0 +1,89 @@
+# SRL Zephyr devkit -- shared build environment for all SRL Zephyr repos.
+#
+# Holds the full Zephyr build toolchain (apt deps, Zephyr SDK, Python venv,
+# west) needed to cross-compile SRL flight/embedded software for hardware
+# targets (e.g. nucleo_h723zg, phoenix_pcb) via the Zephyr SDK's
+# arm-zephyr-eabi toolchain. NO repository is copied into the image -- each
+# working repo is bind-mounted at runtime under /workspaces/<name> (see the
+# `srl` host launcher and docker-compose.yml), so host edits are picked up
+# immediately with no `docker cp` step.
+#
+# Build (from the devkit root, so the build context includes bin/ and docker/):
+#   docker compose -f docker/docker-compose.yml build
+# or:
+#   docker build -f docker/Dockerfile.dev -t srl-zephyr-devkit .
+
+FROM debian:13.1
+
+ARG ZSDK_VERSION=0.17.0
+# Zephyr version whose Python build requirements get baked in. Keep it at (or
+# above) the newest `zephyr` revision pinned across the repos this image serves
+# -- see each repo's west.yaml / srl.yml. requirements-base.txt is very stable
+# across v3.7+/v4.x, so one value normally covers a fleet of repos.
+ARG ZEPHYR_VERSION=v4.0.0
+# Populated automatically by BuildKit (Docker's default builder) to "amd64"
+# or "arm64" depending on the host/target platform.
+ARG TARGETARCH
+
+# Build deps for cross-compiling Zephyr firmware (see any repo's README).
+# Trimmed to what cross-compiling needs -- omits libsdl2-dev and
+# gcc-multilib/g++-multilib, which are only for the native_sim host target.
+RUN apt update && \
+    apt install -y --no-install-recommends git cmake ninja-build gperf \
+      ccache dfu-util device-tree-compiler wget \
+      python3-dev python3-pip python3-setuptools python3-tk python3-wheel python3.13-venv xz-utils file \
+      make gcc build-essential libmagic1 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Download, verify, and extract the Zephyr SDK matching the image's
+# architecture, then delete the archive.
+RUN case "$TARGETARCH" in \
+      amd64) ZSDK_ARCH=linux-x86_64 ;; \
+      arm64) ZSDK_ARCH=linux-aarch64 ;; \
+      *) echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    wget https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK_VERSION}/zephyr-sdk-${ZSDK_VERSION}_${ZSDK_ARCH}.tar.xz && \
+    wget -O - https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK_VERSION}/sha256.sum | shasum --check --ignore-missing && \
+    tar xf zephyr-sdk-${ZSDK_VERSION}_${ZSDK_ARCH}.tar.xz && \
+    rm zephyr-sdk-${ZSDK_VERSION}_${ZSDK_ARCH}.tar.xz
+
+ENV ZEPHYR_SDK_INSTALL_DIR=/zephyr-sdk-${ZSDK_VERSION}
+
+# Python venv with west + the tool's own deps (PyYAML), pinned via
+# requirements.txt.
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+# The ENV above covers non-login shells, but a login shell (bash -l) sources
+# /etc/profile, which rebuilds PATH from scratch and would drop the venv --
+# leaving `west`/`python` missing. Re-add the venv for login shells too.
+RUN printf 'PATH="/opt/venv/bin:$PATH"\n' > /etc/profile.d/venv.sh
+COPY docker/requirements.txt /tmp/requirements.txt
+RUN pip install --upgrade pip && \
+    pip install -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
+
+# Zephyr's build scripts need their own Python deps (pyelftools, PyYAML, ...);
+# without these the build fails with "ModuleNotFoundError: No module named
+# 'elftools'". No repo is copied in, so fetch the pinned Zephyr's
+# self-contained requirements-base.txt and install it into the venv.
+RUN wget -O /tmp/zephyr-requirements-base.txt \
+      https://raw.githubusercontent.com/zephyrproject-rtos/zephyr/${ZEPHYR_VERSION}/scripts/requirements-base.txt && \
+    pip install -r /tmp/zephyr-requirements-base.txt && \
+    rm /tmp/zephyr-requirements-base.txt
+
+# Record what this image ships, so the `srl` tool can warn on a repo whose
+# pinned Zephyr version differs from what the image was built for.
+ENV SRL_IMAGE_ZEPHYR=${ZEPHYR_VERSION}
+ENV SRL_IMAGE_ZSDK=${ZSDK_VERSION}
+
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+# `srl` is the multi-repo build tool (successor to phx). It discovers repos
+# mounted under /workspaces via their srl.yml and drives west for each.
+COPY docker/srl /usr/local/bin/srl
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/srl
+
+# Repos are bind-mounted here at runtime, each at /workspaces/<name>.
+WORKDIR /workspaces
+
+ENTRYPOINT ["entrypoint.sh"]
+CMD ["bash"]

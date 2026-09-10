@@ -1,0 +1,6 @@
+# Python deps for the SRL Zephyr devkit image (installed into /opt/venv).
+west==1.3.0
+# Used by the `srl` tool to parse each repo's srl.yml. (Zephyr's own
+# requirements-base.txt also pulls PyYAML, but pin it here so `srl` works even
+# before any `west update`.)
+PyYAML>=6.0

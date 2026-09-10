@@ -1,0 +1,41 @@
+# srl.yml -- drop this at the root of a Zephyr repo to register it with the
+# SRL devkit. Any sibling repo of SRL-ZEPHYR-DEVKIT that has this file is
+# auto-discovered and mounted at /workspaces/<dir-name> the next time you run
+# `srl`. The directory name is the address you type: `srl build <dir>/<board>`.
+
+# Display name (cosmetic; the directory name is what you type on the CLI).
+name: MY-ZEPHYR-REPO
+
+# Application source dir, relative to the repo root (passed to `west build`).
+app: app
+
+# Zephyr version this repo pins in its west.yaml. Used only to warn you if it
+# differs from what the shared image was built for. Optional but recommended.
+zephyr: v4.0.0
+
+# Board used when you omit one, e.g. `srl build MY-ZEPHYR-REPO`.
+default_board: nucleo_h723zg
+
+# Board used by `srl run` (the native_sim executable).
+sim_board: native_sim/native/64
+
+# Friendly aliases -> real Zephyr board names. Unlisted names pass through
+# to west unchanged, so you can always type the full board name.
+boards:
+  nucleo: nucleo_h723zg
+  sim: native_sim/native/64
+
+# Per-board extra conf/overlay files (relative to the app dir), applied
+# automatically when that board is built.
+board_config:
+  native_sim/native/64:
+    conf: [native_sim.conf]
+    overlay: [native_sim.overlay]
+
+# Named config overlays toggled by flags. `-d/--debug` uses `debug`.
+configs:
+  debug: debug.conf
+
+# Default `west flash` runner per board (override with `srl flash ... -r`).
+runners:
+  phoenix_pcb: jlink
