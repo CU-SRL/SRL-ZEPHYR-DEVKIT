@@ -15,8 +15,26 @@ name: MY-ZEPHYR-REPO
 # `workspace:` is set above). Passed to `west build`.
 app: app
 
-# Zephyr version this repo pins in its west.yaml. Used only to warn you if it
-# differs from what the shared image was built for. Optional but recommended.
+# How `srl init` bootstraps the west workspace, for a repo that isn't one yet
+# (no .west/). Only consulted by `srl init` / the auto-init in `srl build` /
+# `srl update`; an already-initialized repo ignores it. Optional.
+#
+#   manifest: https://github.com/CU-SRL/some-manifest   # remote -> west init -m
+#   manifest: app            # local -> west init -l <workspace>/app
+#
+# A value with "://" (or git@) is treated as a URL and cloned. Otherwise it's a
+# LOCAL subdir (relative to the workspace) that contains west.yml. It must be a
+# subdir, not the root: `west init -l` creates .west in the manifest dir's
+# PARENT, so a root-level manifest would put .west outside the repo. With no
+# `manifest:` set, srl auto-detects a single manifest-bearing subdir.
+# manifest: app
+# manifest_rev: main         # optional, --mr (remote manifests)
+# manifest_file: west.yml    # optional, --mf (non-default manifest filename)
+
+# Zephyr version this repo targets (informational only). Each repo builds
+# against its OWN zephyr/ tree pulled by `west update`, not the image's, so
+# this need not match the image -- it just prints a note if it differs. The
+# image's SDK + base deps cover Zephyr v3.7+/v4.x. Optional.
 zephyr: v4.0.0
 
 # Board used when you omit one, e.g. `srl build MY-ZEPHYR-REPO`.

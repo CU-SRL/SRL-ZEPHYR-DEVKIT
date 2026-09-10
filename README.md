@@ -78,7 +78,19 @@ default_board: nucleo_h723zg
 ```
 
 See `examples/srl.yml` for board aliases, per-board overlays, debug configs,
-and flash runners. `SRL-PHOENIX/srl.yml` is a real working example.
+flash runners, and the optional `workspace:` / `manifest:` keys. `zephyr:` is
+informational only (each repo builds its own pulled `zephyr/`), so it need not
+match the image. `SRL-PHOENIX/srl.yml` is a real working example.
+
+A brand-new repo with only an `srl.yml` (no `.west/` yet) is bootstrapped with
+`srl init <repo>` — it runs `west init` then `west update` to pull Zephyr and
+all modules. `srl build` / `srl update` also auto-init when `.west/` is missing.
+`srl init` gets the manifest from the `manifest:` key in `srl.yml` (a URL to
+clone, or a local manifest subdir); with none set it auto-detects a single
+manifest-bearing subdir. The manifest must live in a **subdirectory** of the
+workspace — `west init` creates `.west/` in the manifest dir's parent, so a
+root-level `west.yml` would place `.west/` outside the repo (srl stops you with
+guidance if so).
 
 ## Commands
 
@@ -89,6 +101,7 @@ srl run    <repo> [args…]                  run the native_sim executable
 srl flash  <repo>[/<board>] [-r RUNNER]    flash a built image
 srl menuconfig <repo>[/<board>]            open Kconfig menuconfig
 srl clean  <repo>[/<board> | --all]        remove build dir(s)
+srl init   <repo>                          west init + update a not-yet-set-up repo
 srl update <repo>                          west update in that repo
 srl refresh                                rescan the registry
 srl shell                                  interactive shell, all repos mounted
@@ -98,7 +111,8 @@ Build options: `-b/--board`, `-d/--debug`, `-p/--pristine always|auto|never`,
 `--no-pristine` (fast incremental), `-t/--target`, `-- <extra cmake args>`.
 `<board>` may be a repo alias (`pcb`, `sim`, …) or a full Zephyr board name.
 
-`srl build` auto-runs `west update` the first time a repo's `zephyr/` is empty.
+`srl build` auto-runs `west init`/`west update` the first time a repo isn't a
+workspace yet or its `zephyr/` is empty.
 
 ## Config
 
@@ -108,9 +122,14 @@ Build options: `-b/--board`, `-d/--debug`, `-p/--pristine always|auto|never`,
 ## Notes / limits
 
 - The image ships **one** Zephyr SDK (`0.17.0`) and one set of Zephyr Python
-  build deps (built for `v4.0.0`). Repos on a compatible Zephyr (v3.7+/v4.x)
-  share it fine; a repo pinning something incompatible gets a warning from
-  `srl` and may need a separately tagged image. Each repo declares its version
-  via `zephyr:` in `srl.yml`.
-- `srl` does not `west init` a workspace — a repo must already be a west
-  workspace (have `.west/`). It will run the first `west update` for you.
+  build deps (built for `v4.0.0`), but the **Zephyr source is per-repo** — each
+  repo's `west update` pulls its own `zephyr/` at whatever its `west.yml` pins,
+  and that tree is what's built. The image's SDK + base deps cover Zephyr
+  v3.7+/v4.x, so repos across that range share it fine; `zephyr:` in `srl.yml`
+  is just an informational note (a differing value prints a one-line note, not
+  a warning). A repo needing a genuinely incompatible Python dep set would need
+  a separately tagged image.
+- `srl init <repo>` bootstraps a repo that isn't a west workspace yet (runs
+  `west init` then `west update`); `srl build`/`srl update` auto-init too. The
+  manifest must sit in a subdirectory of the workspace — see *Registering a
+  repo*.

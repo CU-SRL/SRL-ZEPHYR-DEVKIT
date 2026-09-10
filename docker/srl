@@ -11,6 +11,7 @@ long west invocations and you address any repo by name:
     srl flash  <repo>[/<board>] [-r RUNNER]      # flash a built image
     srl menuconfig <repo>[/<board>]              # open Kconfig menuconfig
     srl clean  <repo>[/<board> | --all]          # remove build dir(s)
+    srl init   <repo>                            # west init + update a new repo
     srl update <repo>                            # west update in that repo
     srl refresh                                  # rescan the registry
 
@@ -110,16 +111,12 @@ def print_summary(reg):
     if not reg:
         warn(f"no repos with an srl.yml found under {WORKSPACES}.")
         return
-    img_zephyr = os.environ.get("SRL_IMAGE_ZEPHYR", "")
     print(f">> registered repos ({len(reg)}):", file=sys.stderr)
     for name, meta in reg.items():
         zver = meta.get("zephyr", "?")
-        ready = "ready" if zephyr_populated(repo_workspace(meta)) else "needs `srl update`"
-        flag = ""
-        if img_zephyr and zver not in ("?", img_zephyr):
-            flag = f"  [!] zephyr {zver} != image {img_zephyr}"
+        ready = "ready" if zephyr_populated(repo_workspace(meta)) else "run `srl init`"
         print(f"   - {name:<22} app={meta.get('app','?'):<16} "
-              f"zephyr={zver:<8} {ready}{flag}", file=sys.stderr)
+              f"zephyr={zver:<8} {ready}", file=sys.stderr)
 
 
 def cmd_list(_args):
@@ -139,7 +136,7 @@ def cmd_list(_args):
         if boards:
             aliases = "  ".join(f"{k}->{v}" for k, v in boards.items())
             print(f"    boards       {aliases}")
-        print(f"    ready        {'yes' if zephyr_populated(repo_workspace(meta)) else 'no (run srl update)'}")
+        print(f"    ready        {'yes' if zephyr_populated(repo_workspace(meta)) else 'no (run srl init)'}")
     return 0
 
 
@@ -197,14 +194,94 @@ def run_west(argv, cwd):
     return subprocess.call(argv, cwd=cwd)
 
 
-def ensure_zephyr(meta):
-    """Lazy first-time `west update` for this repo if its zephyr/ is empty."""
+def _is_manifest_url(spec):
+    return "://" in spec or spec.startswith("git@")
+
+
+def _autodetect_manifest_dir(ws, dirname):
+    """Find the subdirectory of `ws` that holds the west manifest (west.yml).
+
+    It must be a SUBDIR: `west init -l` puts .west in the manifest dir's PARENT,
+    so the manifest has to sit one level under the workspace for .west to land
+    inside the workspace (and thus inside the bind-mounted repo)."""
+    mf = ("west.yml", ".west.yml")
+    subs = [e for e in sorted(os.listdir(ws))
+            if os.path.isdir(os.path.join(ws, e))
+            and any(os.path.isfile(os.path.join(ws, e, n)) for n in mf)]
+    if len(subs) == 1:
+        return subs[0]
+    if len(subs) > 1:
+        die(f"{dirname}: found manifests in multiple subdirs ({', '.join(subs)}); "
+            f"pick one with `manifest: <subdir>` in srl.yml.")
+    if any(os.path.isfile(os.path.join(ws, n)) for n in mf):
+        die(f"{dirname}: west.yml is at the workspace root, so `west init` would "
+            f"create .west OUTSIDE the repo (west puts it in the manifest dir's "
+            f"parent). Move the manifest into a subdir and set `manifest: <subdir>`,"
+            f" or use a remote `manifest: <url>`.")
+    die(f"{dirname}: no west.yml found under {ws}. Add `manifest: <url>` (clone a "
+        f"remote manifest) or `manifest: <subdir>` (a local manifest dir) to "
+        f"srl.yml, then rerun.")
+
+
+def west_init(meta):
+    """Initialize the repo's west workspace so its .west lands in the workspace
+    dir. `manifest:` in srl.yml picks the source: a URL -> `west init -m`
+    (clone it); a local subdir path -> `west init -l`. With no `manifest:`, a
+    single manifest-bearing subdir is auto-detected. `manifest_rev:` (--mr) and
+    `manifest_file:` (--mf) are optional."""
     ws = repo_workspace(meta)
+    dirname = meta["_dir"]
+    spec = meta.get("manifest")
+    if spec is not None and not isinstance(spec, str):
+        die(f"{dirname}: `manifest:` must be a string -- a URL or a local subdir.")
+    mrev = meta.get("manifest_rev")
+    mfile = meta.get("manifest_file")
+
+    if spec and _is_manifest_url(spec):
+        argv = ["west", "init", "-m", spec]
+        if mrev:
+            argv += ["--mr", str(mrev)]
+        if mfile:
+            argv += ["--mf", str(mfile)]
+        argv += [ws]
+    else:
+        man = spec or _autodetect_manifest_dir(ws, dirname)
+        norm = os.path.normpath(man)
+        if os.path.isabs(norm) or norm in (".", "") or norm.startswith(os.pardir):
+            die(f"{dirname}: local manifest '{man}' must be a subdir of the "
+                f"workspace ({ws}); otherwise `west init` puts .west outside the "
+                f"repo. Use a subdir, or a remote `manifest: <url>`.")
+        man_path = os.path.join(ws, norm)
+        if not os.path.isdir(man_path):
+            die(f"{dirname}: manifest dir {man_path} does not exist.")
+        argv = ["west", "init", "-l"]
+        if mfile:
+            argv += ["--mf", str(mfile)]
+        argv += [man_path]
+
+    warn(f"{dirname}: no .west yet; initializing west workspace at {ws}...")
+    rc = run_west(argv, cwd=ws)
+    if rc != 0:
+        die("`west init` failed.")
+    if not os.path.isdir(os.path.join(ws, ".west")):
+        die(f"{dirname}: `west init` did not create {ws}/.west (the workspace "
+            f"topdir landed elsewhere). Check the manifest layout or `workspace:`.")
+
+
+def ensure_workspace(meta):
+    """Make sure the repo is an initialized west workspace (.west present),
+    running `west init` if it is not."""
+    if not os.path.isdir(os.path.join(repo_workspace(meta), ".west")):
+        west_init(meta)
+
+
+def ensure_zephyr(meta):
+    """Ensure the repo is a west workspace with Zephyr pulled: `west init` it if
+    there's no .west yet, then a first-time `west update` if zephyr/ is empty."""
+    ws = repo_workspace(meta)
+    ensure_workspace(meta)
     if zephyr_populated(ws):
         return
-    if not os.path.isdir(os.path.join(ws, ".west")):
-        die(f"{meta['_dir']}: no .west workspace at {ws} -- run `west init` "
-            f"there first (this devkit does not init workspaces).")
     warn(f"{meta['_dir']}: zephyr/ is empty; running first-time `west update` "
          f"(this can take a while)...")
     rc = run_west(["west", "update"], cwd=ws)
@@ -213,11 +290,15 @@ def ensure_zephyr(meta):
 
 
 def warn_version(meta):
+    """A repo builds against its OWN pulled zephyr/ tree, not the image's. This
+    is just an informational note when the pins differ -- not a problem; the
+    image's SDK + base deps cover Zephyr v3.7+/v4.x."""
     img = os.environ.get("SRL_IMAGE_ZEPHYR", "")
     want = meta.get("zephyr")
     if img and want and want != img:
-        warn(f"note: {meta['_dir']} pins zephyr {want} but this image ships "
-             f"{img}; build may misbehave if they are incompatible.")
+        warn(f"note: {meta['_dir']} targets zephyr {want}; the image's base deps "
+             f"were built for {img} (compatible across v3.7+/v4.x). The repo's "
+             f"own zephyr/ tree is what gets built.")
 
 
 def join_semi(items):
@@ -368,10 +449,27 @@ def cmd_clean(args):
     return 0
 
 
+def cmd_init(args):
+    if not args:
+        die("usage: srl init <repo>")
+    meta = get_repo(args[0])
+    ws = repo_workspace(meta)
+    if os.path.isdir(os.path.join(ws, ".west")):
+        warn(f"{meta['_dir']}: already a west workspace at {ws}.")
+    else:
+        west_init(meta)
+    if zephyr_populated(ws):
+        warn(f"{meta['_dir']}: zephyr/ already populated; "
+             f"run `srl update {meta['_dir']}` to refresh it.")
+        return 0
+    return run_west(["west", "update"], cwd=ws)
+
+
 def cmd_update(args):
     if not args:
         die("usage: srl update <repo>")
     meta = get_repo(args[0])
+    ensure_workspace(meta)  # auto `west init` a repo that isn't one yet
     return run_west(["west", "update"] + list(args[1:]), cwd=repo_workspace(meta))
 
 
@@ -388,6 +486,7 @@ COMMANDS = {
     "menuconfig": cmd_menuconfig,
     "guiconfig": cmd_menuconfig,
     "clean": cmd_clean,
+    "init": cmd_init,
     "update": cmd_update,
 }
 
