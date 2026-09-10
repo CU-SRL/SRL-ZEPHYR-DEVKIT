@@ -35,17 +35,32 @@ RUN apt update && \
       make gcc build-essential libmagic1 && \
     rm -rf /var/lib/apt/lists/*
 
-# Download, verify, and extract the Zephyr SDK matching the image's
-# architecture, then delete the archive.
+# Space-separated Zephyr SDK toolchains to install. We cross-compile only for
+# ARM Cortex-M targets (nucleo_h723zg, phoenix_pcb), so we install just
+# arm-zephyr-eabi. Override at build time if a repo adds a non-ARM target, e.g.
+#   --build-arg ZSDK_TOOLCHAINS="arm-zephyr-eabi riscv64-zephyr-elf"
+ARG ZSDK_TOOLCHAINS="arm-zephyr-eabi"
+
+# Install the Zephyr SDK from the *minimal* bundle (~45 MB) plus only the
+# toolchain(s) we actually build for (~115 MB for ARM), instead of the full
+# SDK (~1.7 GB compressed, ~5 GB extracted -- every toolchain: riscv, xtensa,
+# x86, ...). This keeps the image small and, crucially, keeps the multi-arch CI
+# build (arm64 runs QEMU-emulated on an amd64 runner) from exhausting the
+# runner's ~14 GB disk or spending minutes just xz-decompressing toolchains we
+# never use. setup.sh downloads/verifies each toolchain and registers the
+# Zephyr CMake package.
 RUN case "$TARGETARCH" in \
       amd64) ZSDK_ARCH=linux-x86_64 ;; \
       arm64) ZSDK_ARCH=linux-aarch64 ;; \
       *) echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac && \
-    wget https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK_VERSION}/zephyr-sdk-${ZSDK_VERSION}_${ZSDK_ARCH}.tar.xz && \
-    wget -O - https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK_VERSION}/sha256.sum | shasum --check --ignore-missing && \
-    tar xf zephyr-sdk-${ZSDK_VERSION}_${ZSDK_ARCH}.tar.xz && \
-    rm zephyr-sdk-${ZSDK_VERSION}_${ZSDK_ARCH}.tar.xz
+    BUNDLE=zephyr-sdk-${ZSDK_VERSION}_${ZSDK_ARCH}_minimal.tar.xz && \
+    wget -q https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK_VERSION}/${BUNDLE} && \
+    wget -qO - https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK_VERSION}/sha256.sum | shasum --check --ignore-missing && \
+    tar xf ${BUNDLE} && \
+    rm ${BUNDLE} && \
+    ( cd zephyr-sdk-${ZSDK_VERSION} && \
+      ./setup.sh -c $(for t in ${ZSDK_TOOLCHAINS}; do printf ' -t %s' "$t"; done) )
 
 ENV ZEPHYR_SDK_INSTALL_DIR=/zephyr-sdk-${ZSDK_VERSION}
 

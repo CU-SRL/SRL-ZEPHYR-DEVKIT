@@ -38,6 +38,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Reclaim disk on the hosted runner (~14 GB free by default). The minimal
+      # Zephyr SDK already keeps us well under that, but the multi-arch build
+      # plus gha cache export leaves little headroom, so drop big preinstalled
+      # toolchains we don't use to keep a comfortable margin.
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
       # QEMU lets this amd64 runner also build the arm64 image (for Apple
       # Silicon and arm64 Linux hosts).
       - name: Set up QEMU
