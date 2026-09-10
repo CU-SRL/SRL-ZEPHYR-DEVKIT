@@ -13,8 +13,10 @@ srl shell                      # drop into a shell with all repos mounted
 
 ## How it works
 
-- **One image** (`srl-zephyr-devkit`) holds the Zephyr SDK, `west`, apt build
-  deps, and a Python venv. No repo is baked in.
+- **One image** holds the Zephyr SDK, `west`, apt build deps, and a Python
+  venv. No repo is baked in. It's **prebuilt by CI and pulled from GHCR**
+  (`ghcr.io/cu-srl/srl-zephyr-devkit`), so the first run just downloads it —
+  no local build, no SDK download on your machine.
 - **Repos are discovered, not configured.** Any directory that sits **next to**
   this devkit checkout and contains an `srl.yml` is auto-registered. Add a new
   repo → drop in an `srl.yml` → it shows up the next time you run `srl`. No
@@ -33,15 +35,37 @@ srl shell                      # drop into a shell with all repos mounted
 
 ## Setup (once)
 
-1. Put `srl` on your PATH (pick one):
+1. Put `srl` on your PATH. Pick the block for your shell/OS (adjust the path if
+   your checkout isn't at `$HOME/SRL/SRL-ZEPHYR-DEVKIT`):
+
+   **macOS (zsh, the default):**
    ```bash
    echo 'export PATH="$HOME/SRL/SRL-ZEPHYR-DEVKIT/bin:$PATH"' >> ~/.zshrc
    exec zsh
    ```
-2. Build the image (first run auto-builds; downloads the SDK, be patient):
+
+   **Linux (bash):**
    ```bash
-   srl --build list
+   echo 'export PATH="$HOME/SRL/SRL-ZEPHYR-DEVKIT/bin:$PATH"' >> ~/.bashrc
+   exec bash
    ```
+
+   **Windows:** `srl` is a bash script that drives Docker, so run it under
+   [WSL2](https://learn.microsoft.com/windows/wsl/install) with Docker Desktop's
+   WSL integration enabled. Inside your WSL distro it's the Linux setup above —
+   clone the repo into the Linux filesystem (e.g. `~/SRL/...`, not `/mnt/c/...`,
+   for bind-mount performance) and append the `export PATH` line to `~/.bashrc`.
+   Git Bash also works if you prefer it (same line in `~/.bashrc`), but WSL2 is
+   the smoother path for the Docker bind mounts.
+2. Run any command — the first run **pulls** the prebuilt image from GHCR
+   (`ghcr.io/cu-srl/srl-zephyr-devkit`), so there's nothing to build and no
+   Zephyr SDK download on your machine:
+   ```bash
+   srl list
+   ```
+   - `srl --pull …` refreshes to the latest published image.
+   - `srl --build …` builds the image locally from `docker/Dockerfile.dev`
+     instead (for offline use, or when changing the image itself).
 
 ## Registering a repo
 

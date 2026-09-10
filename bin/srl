@@ -11,7 +11,13 @@
 #   srl list                     # list discovered repos
 #   srl build SRL-PHOENIX/pcb    # build a board in a repo
 #   srl flash SRL-PHOENIX/pcb    # forwarded straight to the in-container tool
-#   srl --build [args...]        # force-rebuild the image first, then run
+#   srl --pull  [args...]        # refresh the prebuilt image, then run
+#   srl --build [args...]        # build the image locally instead, then run
+#
+# Image: by default this PULLS a prebuilt image from GHCR
+# (ghcr.io/cu-srl/srl-zephyr-devkit) on first use -- no local build, no Zephyr
+# SDK download on your machine. Use --build to build it yourself from
+# docker/Dockerfile.dev (for offline use or when changing the image).
 #
 # Discovery root: by default the directory that CONTAINS this devkit checkout,
 # so any sibling repo is found by location (not by the parent's name). Override
@@ -22,20 +28,53 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEVKIT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 COMPOSE_FILE="${DEVKIT_ROOT}/docker/docker-compose.yml"
-IMAGE=srl-zephyr-devkit
+# Prebuilt image published by CI (see .github/workflows/build-image.yml); the
+# local name is what `docker compose build` / `srl --build` produces.
+REMOTE_IMAGE=ghcr.io/cu-srl/srl-zephyr-devkit:latest
+LOCAL_IMAGE=srl-zephyr-devkit
 
 # Default root: the dir holding this devkit (its siblings live here).
 DEFAULT_ROOT="$(cd "${DEVKIT_ROOT}/.." && pwd)"
 
-# Parse leading launcher flags (only --build for now).
-FORCE_BUILD=0
-if [ "${1:-}" = "--build" ]; then FORCE_BUILD=1; shift; fi
+# Parse leading launcher flags: --build (build locally), --pull (refresh remote).
+MODE=auto
+case "${1:-}" in
+  --build) MODE=build; shift ;;
+  --pull)  MODE=pull;  shift ;;
+esac
 
-# Build the image if missing (first run) or requested.
-if [ "${FORCE_BUILD}" -eq 1 ] || [ -z "$(docker images -q "${IMAGE}" 2>/dev/null)" ]; then
-  echo ">> building ${IMAGE} (first run downloads the Zephyr SDK; be patient)..." >&2
-  docker compose -f "${COMPOSE_FILE}" build
-fi
+_img_present() { [ -n "$(docker images -q "$1" 2>/dev/null)" ]; }
+
+# Decide which image to run, fetching it if needed.
+case "${MODE}" in
+  build)
+    echo ">> building ${LOCAL_IMAGE} locally (downloads the Zephyr SDK; be patient)..." >&2
+    docker compose -f "${COMPOSE_FILE}" build
+    IMAGE="${LOCAL_IMAGE}"
+    ;;
+  pull)
+    echo ">> pulling ${REMOTE_IMAGE}..." >&2
+    docker pull "${REMOTE_IMAGE}"
+    IMAGE="${REMOTE_IMAGE}"
+    ;;
+  auto)
+    if _img_present "${REMOTE_IMAGE}"; then
+      IMAGE="${REMOTE_IMAGE}"
+    elif _img_present "${LOCAL_IMAGE}"; then
+      IMAGE="${LOCAL_IMAGE}"
+    else
+      echo ">> pulling prebuilt ${REMOTE_IMAGE} (first run; no local build needed)..." >&2
+      if docker pull "${REMOTE_IMAGE}"; then
+        IMAGE="${REMOTE_IMAGE}"
+      else
+        echo "error: could not pull ${REMOTE_IMAGE}." >&2
+        echo "       if the package is private, run: docker login ghcr.io" >&2
+        echo "       or build it locally instead with: srl --build ${*:-list}" >&2
+        exit 1
+      fi
+    fi
+    ;;
+esac
 
 # Split SRL_WORKSPACES on ':' into ROOTS (default = the devkit's parent).
 ROOTS=()

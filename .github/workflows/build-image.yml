@@ -1,0 +1,76 @@
+# Build the shared SRL Zephyr devkit image and publish it to the GitHub
+# Container Registry (GHCR), so `srl` can PULL a prebuilt image instead of
+# every developer building it (and downloading the Zephyr SDK) themselves.
+#
+# Published as: ghcr.io/cu-srl/srl-zephyr-devkit
+#   :latest        -> newest build of the default branch
+#   :sha-<commit>  -> the exact commit it was built from
+#   :vX.Y.Z        -> when a matching git tag is pushed
+#
+# First-time setup (once, by a repo admin): after the first successful run,
+# open the package at https://github.com/orgs/CU-SRL/packages, and under
+# "Package settings" set visibility to Public so `srl` can pull it without a
+# login. (Private is fine too, but then users must `docker login ghcr.io`.)
+name: build-image
+
+on:
+  push:
+    branches: [main]
+    # Only rebuild when something that affects the image changes.
+    paths:
+      - docker/**
+      - .github/workflows/build-image.yml
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # QEMU lets this amd64 runner also build the arm64 image (for Apple
+      # Silicon and arm64 Linux hosts).
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/cu-srl/srl-zephyr-devkit
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
+            type=semver,pattern=v{{version}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.dev
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
