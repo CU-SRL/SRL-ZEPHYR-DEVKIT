@@ -15,12 +15,16 @@
 
 FROM debian:13.1
 
-ARG ZSDK_VERSION=0.17.0
-# Zephyr version whose Python build requirements get baked in. Keep it at (or
-# above) the newest `zephyr` revision pinned across the repos this image serves
-# -- see each repo's west.yaml / srl.yml. requirements-base.txt is very stable
-# across v3.7+/v4.x, so one value normally covers a fleet of repos.
-ARG ZEPHYR_VERSION=v4.0.0
+# Space-separated Zephyr SDK versions to install side by side. Different Zephyr
+# releases require different SDKs (v4.0.0 wants 0.17.0; main wants 1.0.1, and the
+# 0.x vs 1.x SDKs are mutually incompatible), so the image ships both and each
+# repo's build auto-selects the SDK compatible with its own `zephyr/` tree.
+ARG ZSDK_VERSIONS="0.17.0 1.0.1"
+# Space-separated Zephyr versions whose Python build requirements get baked in --
+# one per distinct `zephyr` revision across the repos this image serves (see each
+# repo's west.yaml / srl.yml). requirements-base.txt is stable within a minor
+# release; installed newest-last so the tip's pins win on any overlap.
+ARG ZEPHYR_VERSIONS="v4.0.0 main"
 # Populated automatically by BuildKit (Docker's default builder) to "amd64"
 # or "arm64" depending on the host/target platform.
 ARG TARGETARCH
@@ -54,15 +58,21 @@ RUN case "$TARGETARCH" in \
       arm64) ZSDK_ARCH=linux-aarch64 ;; \
       *) echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac && \
-    BUNDLE=zephyr-sdk-${ZSDK_VERSION}_${ZSDK_ARCH}_minimal.tar.xz && \
-    wget -q https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK_VERSION}/${BUNDLE} && \
-    wget -qO - https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK_VERSION}/sha256.sum | shasum --check --ignore-missing && \
-    tar xf ${BUNDLE} && \
-    rm ${BUNDLE} && \
-    ( cd zephyr-sdk-${ZSDK_VERSION} && \
-      ./setup.sh -c $(for t in ${ZSDK_TOOLCHAINS}; do printf ' -t %s' "$t"; done) )
+    mkdir -p /opt && cd /opt && \
+    for ZSDK_VERSION in ${ZSDK_VERSIONS}; do \
+      BUNDLE=zephyr-sdk-${ZSDK_VERSION}_${ZSDK_ARCH}_minimal.tar.xz && \
+      wget -q https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK_VERSION}/${BUNDLE} && \
+      wget -qO - https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZSDK_VERSION}/sha256.sum | shasum --check --ignore-missing && \
+      tar xf ${BUNDLE} && \
+      rm ${BUNDLE} && \
+      ( cd zephyr-sdk-${ZSDK_VERSION} && \
+        ./setup.sh -c $(for t in ${ZSDK_TOOLCHAINS}; do printf ' -t %s' "$t"; done) ); \
+    done
 
-ENV ZEPHYR_SDK_INSTALL_DIR=/zephyr-sdk-${ZSDK_VERSION}
+# Deliberately NOT setting ZEPHYR_SDK_INSTALL_DIR: that pins the build to one SDK
+# dir. Left unset, Zephyr's FindZephyr-sdk enumerates every SDK under /opt (and
+# the CMake package registry each setup.sh -c wrote) and picks the one whose
+# Zephyr-sdkConfig declares itself compatible with the tree being built.
 
 # Python venv with west + the tool's own deps (PyYAML), pinned via
 # requirements.txt.
@@ -81,15 +91,17 @@ RUN pip install --upgrade pip && \
 # without these the build fails with "ModuleNotFoundError: No module named
 # 'elftools'". No repo is copied in, so fetch the pinned Zephyr's
 # self-contained requirements-base.txt and install it into the venv.
-RUN wget -O /tmp/zephyr-requirements-base.txt \
-      https://raw.githubusercontent.com/zephyrproject-rtos/zephyr/${ZEPHYR_VERSION}/scripts/requirements-base.txt && \
-    pip install -r /tmp/zephyr-requirements-base.txt && \
-    rm /tmp/zephyr-requirements-base.txt
+RUN for ZV in ${ZEPHYR_VERSIONS}; do \
+      wget -O /tmp/zephyr-requirements-base.txt \
+        https://raw.githubusercontent.com/zephyrproject-rtos/zephyr/${ZV}/scripts/requirements-base.txt && \
+      pip install -r /tmp/zephyr-requirements-base.txt && \
+      rm /tmp/zephyr-requirements-base.txt; \
+    done
 
-# Record what this image ships, so the `srl` tool can warn on a repo whose
-# pinned Zephyr version differs from what the image was built for.
-ENV SRL_IMAGE_ZEPHYR=${ZEPHYR_VERSION}
-ENV SRL_IMAGE_ZSDK=${ZSDK_VERSION}
+# Record what this image ships, so the `srl` tool can note a repo whose pinned
+# Zephyr version isn't among the ones the image was built for.
+ENV SRL_IMAGE_ZEPHYR=${ZEPHYR_VERSIONS}
+ENV SRL_IMAGE_ZSDK=${ZSDK_VERSIONS}
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 # `srl` is the multi-repo build tool (successor to phx). It discovers repos
