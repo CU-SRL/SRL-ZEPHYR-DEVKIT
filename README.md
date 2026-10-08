@@ -13,7 +13,7 @@ srl shell                      # drop into a shell with all repos mounted
 
 ## How it works
 
-- **One image** holds the Zephyr SDK, `west`, apt build deps, and a Python
+- **One image** holds the Zephyr SDKs, `west`, apt build deps, and a Python
   venv. No repo is baked in. It's **prebuilt by CI and pulled from GHCR**
   (`ghcr.io/cu-srl/srl-zephyr-devkit`), so the first run just downloads it —
   no local build, no SDK download on your machine.
@@ -121,14 +121,17 @@ workspace yet or its `zephyr/` is empty.
 
 ## Notes / limits
 
-- The image ships **one** Zephyr SDK (`0.17.0`) and one set of Zephyr Python
-  build deps (built for `v4.0.0`), but the **Zephyr source is per-repo** — each
-  repo's `west update` pulls its own `zephyr/` at whatever its `west.yml` pins,
-  and that tree is what's built. The image's SDK + base deps cover Zephyr
-  v3.7+/v4.x, so repos across that range share it fine; `zephyr:` in `srl.yml`
-  is just an informational note (a differing value prints a one-line note, not
-  a warning). A repo needing a genuinely incompatible Python dep set would need
-  a separately tagged image.
+- The image ships **two** Zephyr SDKs side by side (`0.17.0` and `1.0.1`, under
+  `/opt`) and the Zephyr Python build deps for `v4.0.0` and `main`, but the
+  **Zephyr source is per-repo** — each repo's `west update` pulls its own
+  `zephyr/` at whatever its `west.yml` pins, and that tree is what's built.
+  `ZEPHYR_SDK_INSTALL_DIR` is deliberately unset, so each build auto-selects
+  the SDK its tree is compatible with (v4.0.0 → `0.17.0`, main → `1.0.1`; the
+  0.x and 1.x SDKs reject each other's trees). `zephyr:` in `srl.yml` is just
+  informational (a value the image wasn't built for prints a one-line note, not
+  a warning). To serve another Zephyr line, add its SDK (see the tree's
+  `SDK_VERSION` file) to `ZSDK_VERSIONS` and its tag to `ZEPHYR_VERSIONS` in
+  `docker/Dockerfile.dev`, then rebuild with `srl --build`.
 - `srl init <repo>` bootstraps a repo that isn't a west workspace yet (runs
   `west init` then `west update`); `srl build`/`srl update` auto-init too. The
   manifest must sit in a subdirectory of the workspace — see *Registering a

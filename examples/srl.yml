@@ -33,8 +33,9 @@ app: app
 
 # Zephyr version this repo targets (informational only). Each repo builds
 # against its OWN zephyr/ tree pulled by `west update`, not the image's, so
-# this need not match the image -- it just prints a note if it differs. The
-# image's SDK + base deps cover Zephyr v3.7+/v4.x. Optional.
+# this need not match the image -- it just prints a note if the image wasn't
+# built for it. The image ships SDKs + base deps for v4.0.0 and main, and the
+# build auto-selects the SDK the tree is compatible with. Optional.
 zephyr: v4.0.0
 
 # Board used when you omit one, e.g. `srl build MY-ZEPHYR-REPO`.

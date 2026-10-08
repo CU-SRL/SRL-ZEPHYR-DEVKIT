@@ -291,14 +291,15 @@ def ensure_zephyr(meta):
 
 def warn_version(meta):
     """A repo builds against its OWN pulled zephyr/ tree, not the image's. This
-    is just an informational note when the pins differ -- not a problem; the
-    image's SDK + base deps cover Zephyr v3.7+/v4.x."""
-    img = os.environ.get("SRL_IMAGE_ZEPHYR", "")
+    is just an informational note when the repo's pin isn't one of the Zephyr
+    versions the image was built for -- the build auto-selects whichever
+    installed SDK is compatible with that tree."""
+    img = os.environ.get("SRL_IMAGE_ZEPHYR", "").split()
     want = meta.get("zephyr")
-    if img and want and want != img:
+    if img and want and str(want) not in img:
         warn(f"note: {meta['_dir']} targets zephyr {want}; the image's base deps "
-             f"were built for {img} (compatible across v3.7+/v4.x). The repo's "
-             f"own zephyr/ tree is what gets built.")
+             f"were built for {', '.join(img)}. The repo's own zephyr/ tree is "
+             f"what gets built, with whichever installed SDK it accepts.")
 
 
 def join_semi(items):
