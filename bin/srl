@@ -110,7 +110,14 @@ else
   set -- srl "$@"
 fi
 
+# Trust every git repo under /workspaces (the repo, its zephyr/, west modules).
+# Bind mounts can show up owned by a different uid than the container user
+# (notably Docker on WSL2), which makes git refuse them with "detected dubious
+# ownership". Passed as env so it applies to the shell and to west alike.
 exec docker run --rm -it \
+  -e GIT_CONFIG_COUNT=1 \
+  -e GIT_CONFIG_KEY_0=safe.directory \
+  -e "GIT_CONFIG_VALUE_0=/workspaces/*" \
   ${MOUNTS[@]+"${MOUNTS[@]}"} \
   -w /workspaces \
   "${IMAGE}" "$@"
