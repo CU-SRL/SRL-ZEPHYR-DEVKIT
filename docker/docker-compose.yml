@@ -28,6 +28,13 @@ services:
     working_dir: /workspaces
     stdin_open: true
     tty: true
+    # Trust every git repo under /workspaces: bind mounts can show up owned by a
+    # different uid than the container user (notably Docker on WSL2), which makes
+    # git refuse them with "detected dubious ownership". Mirrors bin/srl.
+    environment:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: /workspaces/*
     volumes:
       # SRL_WORKSPACES may point at the directory that holds your repos.
       # Default `../..` = the devkit's parent dir (its sibling repos).
