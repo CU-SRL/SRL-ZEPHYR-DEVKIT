@@ -98,6 +98,14 @@ RUN for ZV in ${ZEPHYR_VERSIONS}; do \
       rm /tmp/zephyr-requirements-base.txt; \
     done
 
+# The baked deps above only cover ZEPHYR_VERSIONS' base requirements. At build
+# time `srl` installs whatever else the repo's own zephyr/ tree and west-imported
+# modules declare into an overlay venv under SRL_PYDEPS -- a named volume mounted
+# by the launcher, so installs survive the --rm container. Pre-create it so a
+# fresh volume is copied from the image with sane ownership.
+ENV SRL_PYDEPS=/opt/srl-pydeps
+RUN mkdir -p ${SRL_PYDEPS}
+
 # Record what this image ships, so the `srl` tool can note a repo whose pinned
 # Zephyr version isn't among the ones the image was built for.
 ENV SRL_IMAGE_ZEPHYR=${ZEPHYR_VERSIONS}

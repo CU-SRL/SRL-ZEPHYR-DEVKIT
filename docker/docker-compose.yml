@@ -39,3 +39,10 @@ services:
       # SRL_WORKSPACES may point at the directory that holds your repos.
       # Default `../..` = the devkit's parent dir (its sibling repos).
       - ${SRL_WORKSPACES:-../..}:/workspaces
+      # Per-Zephyr-tree Python deps installed by `srl` at build time.
+      - srl-pydeps:/opt/srl-pydeps
+
+volumes:
+  # Shared with the `srl` host launcher (same volume name, not compose-prefixed).
+  srl-pydeps:
+    name: srl-pydeps

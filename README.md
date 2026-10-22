@@ -103,6 +103,7 @@ srl menuconfig <repo>[/<board>]            open Kconfig menuconfig
 srl clean  <repo>[/<board> | --all]        remove build dir(s)
 srl init   <repo>                          west init + update a not-yet-set-up repo
 srl update <repo>                          west update in that repo
+srl deps   <repo> [--force]                (re)install the tree's Python deps
 srl refresh                                rescan the registry
 srl shell                                  interactive shell, all repos mounted
 ```
@@ -132,6 +133,21 @@ workspace yet or its `zephyr/` is empty.
   a warning). To serve another Zephyr line, add its SDK (see the tree's
   `SDK_VERSION` file) to `ZSDK_VERSIONS` and its tag to `ZEPHYR_VERSIONS` in
   `docker/Dockerfile.dev`, then rebuild with `srl --build`.
+- **Python deps are resolved per tree, at build time.** Before `build`,
+  `flash`, `menuconfig` (and after `init`/`update`), `srl` collects the
+  requirement files the repo's own pulled tree declares — `zephyr/scripts/
+  requirements.txt` plus every west-imported module whose `zephyr/module.yml`
+  has `package-managers: pip:` (the same set upstream `west packages pip`
+  uses, but works on trees that predate that command, e.g. v4.0.0) — and
+  installs them into an overlay venv under `/opt/srl-pydeps/<hash>`, on the
+  persistent `srl-pydeps` Docker volume. The hash covers the files' contents,
+  so each distinct requirement set installs once and repos on the same Zephyr
+  revision share it; changing revisions just creates a new overlay. West then
+  runs under the overlay's python, which CMake picks up as `WEST_PYTHON`.
+  Override the zephyr part with `python_requirements: [<files relative to the
+  workspace>]` in `srl.yml` (modules are still added). In `srl shell`, run
+  `srl deps <repo>` to get the `source …/activate` line for running `west` by
+  hand. Wipe all overlays with `docker volume rm srl-pydeps`.
 - `srl init <repo>` bootstraps a repo that isn't a west workspace yet (runs
   `west init` then `west update`); `srl build`/`srl update` auto-init too. The
   manifest must sit in a subdirectory of the workspace — see *Registering a

@@ -13,12 +13,25 @@ long west invocations and you address any repo by name:
     srl clean  <repo>[/<board> | --all]          # remove build dir(s)
     srl init   <repo>                            # west init + update a new repo
     srl update <repo>                            # west update in that repo
+    srl deps   <repo> [--force]                  # (re)install its Python deps
     srl refresh                                  # rescan the registry
 
 `<board>` may be a repo-defined alias (see srl.yml `boards:`); anything else is
 passed straight through to west. Every command prints the exact west line it
 runs, prefixed with `+ `.
+
+Python deps: the image only bakes Zephyr's base requirements for the versions
+it was built for. Before running west for a repo, srl reads the requirement
+files from that repo's OWN pulled tree -- zephyr/scripts/requirements.txt plus
+every west-imported module that declares `package-managers: pip:` in its
+zephyr/module.yml (the same set upstream's `west packages pip` installs) -- and
+installs them into an overlay venv keyed by a hash of those files. Overlays
+live on the persistent `srl-pydeps` volume (the container itself is --rm), so
+each distinct requirement set is installed once and shared by every repo on the
+same Zephyr revision. The overlay sees the image venv's packages via a .pth
+file, so pip only fetches what's missing or pinned differently.
 """
+import hashlib
 import json
 import os
 import shutil
@@ -27,6 +40,7 @@ import sys
 
 WORKSPACES = "/workspaces"
 REGISTRY_CACHE = "/tmp/srl-registry.json"
+PYDEPS_ROOT = os.environ.get("SRL_PYDEPS", "/opt/srl-pydeps")
 META_NAMES = ("srl.yml", ".srl.yml")
 
 PROG = "srl"
@@ -188,10 +202,144 @@ def build_dir_for(meta, board):
     return f"build/{board}/{app_base}"
 
 
-def run_west(argv, cwd):
+def run_west(argv, cwd, py=None):
+    """Run a west command. With `py` (an overlay venv's python), west runs under
+    that interpreter so `west build` hands it to CMake as WEST_PYTHON and every
+    Zephyr build script sees the overlay's packages."""
     sys.stderr.write("+ " + " ".join(argv) + "\n")
     sys.stderr.flush()
-    return subprocess.call(argv, cwd=cwd)
+    env = None
+    if py and argv and argv[0] == "west":
+        venv = os.path.dirname(os.path.dirname(py))
+        env = dict(os.environ, VIRTUAL_ENV=venv,
+                   PATH=os.path.join(venv, "bin") + os.pathsep + os.environ.get("PATH", ""))
+        argv = [py, "-m", "west"] + list(argv[1:])
+    return subprocess.call(argv, cwd=cwd, env=env)
+
+
+# --------------------------------------------------------------------------- #
+# Per-tree Python deps (overlay venvs on the srl-pydeps volume)
+# --------------------------------------------------------------------------- #
+def _module_yml(project_path):
+    for n in ("module.yml", "module.yaml"):
+        p = os.path.join(project_path, "zephyr", n)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def requirement_files(meta):
+    """Requirement files this repo's pulled tree asks for, as absolute paths.
+
+    Zephyr's own scripts/requirements.txt, unless srl.yml `python_requirements:`
+    lists files (relative to the workspace) to use instead; plus the pip
+    requirement-files of every west project whose zephyr/module.yml declares
+    `package-managers: pip:`."""
+    ws = repo_workspace(meta)
+    custom = meta.get("python_requirements")
+    if custom is not None:
+        if isinstance(custom, str):
+            custom = [custom]
+        files = [os.path.join(ws, f) for f in custom]
+    else:
+        files = [os.path.join(ws, "zephyr", "scripts", "requirements.txt")]
+
+    out = subprocess.run(["west", "list", "-f", "{abspath}"], cwd=ws,
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        warn(f"{meta['_dir']}: `west list` failed; only using zephyr's "
+             f"requirements.\n{out.stderr.strip()}")
+        projects = []
+    else:
+        projects = out.stdout.split()
+    for proj in projects:
+        myml = _module_yml(proj)
+        if not myml:
+            continue
+        pip = ((load_yaml(myml).get("package-managers") or {}).get("pip") or {})
+        files += [os.path.join(proj, r) for r in pip.get("requirement-files", [])]
+
+    seen, result = set(), []
+    for f in files:
+        f = os.path.normpath(f)
+        if f in seen:
+            continue
+        seen.add(f)
+        if os.path.isfile(f):
+            result.append(f)
+        else:
+            warn(f"{meta['_dir']}: requirements file {f} not found; skipping.")
+    return result
+
+
+def _hash_requirements(files, ws, h, seen=None):
+    """Hash requirement files' contents, following nested `-r`/`-c` includes,
+    so editing any of them yields a new overlay. Paths are hashed relative to
+    the workspace, so repos on the same Zephyr revision share one overlay."""
+    seen = set() if seen is None else seen
+    for f in files:
+        if f in seen or not os.path.isfile(f):
+            continue
+        seen.add(f)
+        with open(f, "rb") as fh:
+            data = fh.read()
+        h.update(os.path.relpath(f, ws).encode() + b"\0" + data + b"\0")
+        nested = []
+        for line in data.decode(errors="replace").splitlines():
+            parts = line.split("#", 1)[0].split()
+            if len(parts) == 2 and parts[0] in ("-r", "--requirement", "-c", "--constraint"):
+                nested.append(os.path.join(os.path.dirname(f), parts[1]))
+        _hash_requirements(nested, ws, h, seen)
+
+
+def ensure_pydeps(meta, force=False):
+    """Return the python of an overlay venv holding this tree's requirements,
+    installing it first if needed. Returns None (build falls back to the image
+    venv) when there's nothing to install or the install fails."""
+    files = requirement_files(meta)
+    if not files:
+        return None
+    # Key on the interpreter + image venv too: a rebuilt image gets fresh overlays.
+    h = hashlib.sha256(sys.version.encode() + b"\0" + sys.prefix.encode() + b"\0")
+    _hash_requirements(files, repo_workspace(meta), h)
+    key = h.hexdigest()[:16]
+
+    venv = os.path.join(PYDEPS_ROOT, key)
+    py = os.path.join(venv, "bin", "python")
+    stamp = os.path.join(venv, ".srl-complete")
+    if os.path.isfile(stamp) and not force:
+        return py
+
+    warn(f"{meta['_dir']}: installing Python deps for this tree into {venv} "
+         f"(once per requirement set)...")
+    if force and os.path.isdir(venv):
+        shutil.rmtree(venv)
+    try:
+        os.makedirs(PYDEPS_ROOT, exist_ok=True)
+        if not os.path.isfile(py):
+            subprocess.check_call([sys.executable, "-m", "venv", venv])
+        # Expose the image venv's packages (west, the baked base deps) beneath
+        # the overlay's own site-packages, so pip only installs the delta.
+        site = subprocess.check_output(
+            [py, "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+            text=True).strip()
+        base_site = subprocess.check_output(
+            [sys.executable, "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+            text=True).strip()
+        with open(os.path.join(site, "srl-image-venv.pth"), "w") as fh:
+            fh.write(base_site + "\n")
+        argv = [py, "-m", "pip", "install", "--disable-pip-version-check"]
+        for f in files:
+            argv += ["-r", f]
+        sys.stderr.write("+ " + " ".join(argv) + "\n")
+        subprocess.check_call(argv)
+    except (OSError, subprocess.CalledProcessError) as e:
+        warn(f"{meta['_dir']}: Python deps install failed ({e}); continuing with "
+             f"the image's venv. Retry with `srl deps {meta['_dir']} --force`.")
+        return None
+    with open(stamp, "w") as fh:
+        fh.write("\n".join(files) + "\n")
+    return py
 
 
 def _is_manifest_url(spec):
@@ -372,13 +520,14 @@ def cmd_build(args):
         sys.stderr.write(f"+ rm -rf {bdir}  (pristine)\n")
         shutil.rmtree(abs_bdir)
 
+    py = ensure_pydeps(meta)
     argv = ["west", "build", "-b", board, "-d", bdir, "--pristine", pristine]
     if target:
         argv += ["-t", target]
     argv += [app]
     if dargs or extra:
         argv += ["--"] + dargs + extra
-    return run_west(argv, cwd=ws)
+    return run_west(argv, cwd=ws, py=py)
 
 
 def cmd_run(args):
@@ -416,7 +565,7 @@ def cmd_flash(args):
     argv = ["west", "flash", "--build-dir", build_dir_for(meta, board)]
     if runner:
         argv += ["--runner", runner]
-    return run_west(argv, cwd=repo_workspace(meta))
+    return run_west(argv, cwd=repo_workspace(meta), py=ensure_pydeps(meta))
 
 
 def cmd_menuconfig(args):
@@ -427,7 +576,7 @@ def cmd_menuconfig(args):
     board = resolve_board(meta, board_in)
     return run_west(
         ["west", "build", "-d", build_dir_for(meta, board), "-t", "menuconfig"],
-        cwd=repo_workspace(meta))
+        cwd=repo_workspace(meta), py=ensure_pydeps(meta))
 
 
 def cmd_clean(args):
@@ -463,7 +612,10 @@ def cmd_init(args):
         warn(f"{meta['_dir']}: zephyr/ already populated; "
              f"run `srl update {meta['_dir']}` to refresh it.")
         return 0
-    return run_west(["west", "update"], cwd=ws)
+    rc = run_west(["west", "update"], cwd=ws)
+    if rc == 0:
+        ensure_pydeps(meta)
+    return rc
 
 
 def cmd_update(args):
@@ -471,7 +623,23 @@ def cmd_update(args):
         die("usage: srl update <repo>")
     meta = get_repo(args[0])
     ensure_workspace(meta)  # auto `west init` a repo that isn't one yet
-    return run_west(["west", "update"] + list(args[1:]), cwd=repo_workspace(meta))
+    rc = run_west(["west", "update"] + list(args[1:]), cwd=repo_workspace(meta))
+    if rc == 0:
+        ensure_pydeps(meta)  # new revisions/modules may want new packages
+    return rc
+
+
+def cmd_deps(args):
+    if not args:
+        die("usage: srl deps <repo> [--force]")
+    meta = get_repo(args[0])
+    ensure_zephyr(meta)
+    py = ensure_pydeps(meta, force="--force" in args[1:])
+    if not py:
+        return 1
+    # Handy for running west by hand in `srl shell`.
+    print(f"source {os.path.dirname(py)}/activate")
+    return 0
 
 
 COMMANDS = {
@@ -489,6 +657,7 @@ COMMANDS = {
     "clean": cmd_clean,
     "init": cmd_init,
     "update": cmd_update,
+    "deps": cmd_deps,
 }
 
 

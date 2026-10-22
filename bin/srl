@@ -114,10 +114,14 @@ fi
 # Bind mounts can show up owned by a different uid than the container user
 # (notably Docker on WSL2), which makes git refuse them with "detected dubious
 # ownership". Passed as env so it applies to the shell and to west alike.
+#
+# srl-pydeps: named volume holding the per-Zephyr-tree Python overlay venvs the
+# in-container srl installs at build time; it outlives the --rm container.
 exec docker run --rm -it \
   -e GIT_CONFIG_COUNT=1 \
   -e GIT_CONFIG_KEY_0=safe.directory \
   -e "GIT_CONFIG_VALUE_0=/workspaces/*" \
   ${MOUNTS[@]+"${MOUNTS[@]}"} \
+  -v srl-pydeps:/opt/srl-pydeps \
   -w /workspaces \
   "${IMAGE}" "$@"
